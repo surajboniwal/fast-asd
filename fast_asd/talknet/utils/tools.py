@@ -29,7 +29,7 @@ def init_args(args):
 def download_pretrain_model_AVA():
     if os.path.isfile('pretrain_AVA.model') == False:
         Link = "1NVIkksrD3zbxbDuDbPc_846bLfPSZcZm"
-        cmd = "gdown --id %s -O %s"%(Link, 'pretrain_AVA.model')
+        cmd = "gdown %s -O %s"%(Link, 'pretrain_AVA.model')
         subprocess.call(cmd, shell=True, stdout=None)
 
 def preprocess_AVA(args):
@@ -74,7 +74,7 @@ def preprocess_AVA(args):
 def download_csv(args): 
     # Take 1 minute to download the required csv files
     Link = "1C1cGxPHaJAl1NQ2i7IhRgWmdvsPhBCUy"
-    cmd = "gdown --id %s -O %s"%(Link, args.dataPathAVA + '/csv.tar.gz')
+    cmd = "gdown %s -O %s"%(Link, args.dataPathAVA + '/csv.tar.gz')
     subprocess.call(cmd, shell=True, stdout=None)
     cmd = "tar -xzvf %s -C %s"%(args.dataPathAVA + '/csv.tar.gz', args.dataPathAVA)
     subprocess.call(cmd, shell=True, stdout=None)

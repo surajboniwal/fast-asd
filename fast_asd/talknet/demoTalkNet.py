@@ -16,7 +16,7 @@ from .talkNet import talkNet
 
 warnings.filterwarnings("ignore")
 
-pretrained_model_path = "/root/.cache/models/pretrain_TalkSet.model"
+pretrained_model_path = os.path.join(os.path.expanduser("~"), ".cache", "fast-asd", "pretrain_TalkSet.model")
 save_path = "save/"
 data_loader_thread = 10
 face_detection_scale = 0.25
@@ -34,8 +34,9 @@ videoFilePath = os.path.join(pyaviPath, 'video.avi')
 audioFilePath = os.path.join(pyaviPath, 'audio.wav')
 
 if os.path.isfile(pretrained_model_path) == False: # Download the pretrained model
+    os.makedirs(os.path.dirname(pretrained_model_path), exist_ok=True)
     Link = "1AbN9fCf9IexMxEKXLQY2KYBlb-IhSEea"
-    cmd = "gdown --id %s -O %s"%(Link, pretrained_model_path)
+    cmd = "gdown %s -O %s"%(Link, pretrained_model_path)
     subprocess.call(cmd, shell=True, stdout=None)
 
 def scene_detect(video_path, save = False, start_frame = 0, end_frame = None):

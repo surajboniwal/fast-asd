@@ -6,7 +6,7 @@ from torchvision import transforms
 from .nets import S3FDNet
 from .box_utils import nms_
 
-PATH_WEIGHT = 'model/faceDetector/s3fd/sfd_face.pth'
+PATH_WEIGHT = os.path.join(os.path.dirname(__file__), 'sfd_face.pth')
 if os.path.isfile(PATH_WEIGHT) == False:
     cmd = "wget -O %s https://storage.googleapis.com/mango-public-models/sfd_face.pth"%(PATH_WEIGHT)
     subprocess.call(cmd, shell=True, stdout=None)

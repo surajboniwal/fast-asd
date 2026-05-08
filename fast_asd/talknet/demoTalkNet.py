@@ -321,19 +321,7 @@ def evaluate_network(s, files):
     # GPU: active speaker detection by pretrained TalkNet
     allScores = []
     # durationSet = {1,2,4,6} # To make the result more reliable
-    durationSet = {
-        1,
-        1,
-        1,
-        2,
-        2,
-        2,
-        3,
-        3,
-        4,
-        5,
-        6,
-    }  # Use this line can get more reliable result
+    durationSet = {1, 2, 4, 6}
     for file in tqdm.tqdm(files, total=len(files)):
         fileName = os.path.splitext(file.split("/")[-1])[0]  # Load audio and video
         # print(os.path.join(pycropPath, fileName + '.wav'))

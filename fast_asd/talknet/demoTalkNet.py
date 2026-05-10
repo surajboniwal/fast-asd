@@ -93,26 +93,37 @@ def initialize_detector(device="cuda"):
     return DET
 
 
+_FACE_DETECT_BATCH = 64
+
+
+def _build_dets(batch_results, batch_start_fidx, start_frame):
+    dets = []
+    for fidx, bboxes in enumerate(batch_results):
+        global_fidx = batch_start_fidx + fidx
+        dets.append([
+            {
+                "frame": global_fidx + start_frame,
+                "bbox": (bbox[:-1]).tolist(),
+                "conf": bbox[-1],
+            }
+            for bbox in bboxes
+        ])
+    return dets
+
+
 def predict_faces(DET, start_frame=0):
-    # GPU: Face detection, output is the list contains the face location and score in this frame
     flist = glob.glob(os.path.join(pyframesPath, "*.jpg"))
     flist.sort()
     dets = []
-    for fidx, fname in enumerate(flist):
-        image = cv2.imread(fname)
-        imageNumpy = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        bboxes = DET.detect_faces(
-            imageNumpy, conf_th=0.9, scales=[face_detection_scale]
+    for batch_start in range(0, len(flist), _FACE_DETECT_BATCH):
+        batch_files = flist[batch_start : batch_start + _FACE_DETECT_BATCH]
+        images = [
+            cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB) for f in batch_files
+        ]
+        batch_results = DET.detect_faces_batch(
+            images, conf_th=0.9, scales=[face_detection_scale]
         )
-        dets.append([])
-        for bbox in bboxes:
-            dets[-1].append(
-                {
-                    "frame": fidx + start_frame,
-                    "bbox": (bbox[:-1]).tolist(),
-                    "conf": bbox[-1],
-                }
-            )  # dets has the frames info, bbox info, conf info
+        dets.extend(_build_dets(batch_results, batch_start, start_frame))
 
     savePath = os.path.join(pyworkPath, "faces.pckl")
     with open(savePath, "wb") as fil:
@@ -121,30 +132,264 @@ def predict_faces(DET, start_frame=0):
 
 
 def predict_faces_from_frames(DET, frames, start_frame=0):
-    # GPU: Face detection, output is the list contains the face location and score in this frame
     dets = []
-    import time
-
-    for fidx, frame in enumerate(frames):
-        t = time.time()
-        imageNumpy = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        bboxes = DET.detect_faces(
-            imageNumpy, conf_th=0.9, scales=[face_detection_scale]
+    for batch_start in range(0, len(frames), _FACE_DETECT_BATCH):
+        batch_frames = frames[batch_start : batch_start + _FACE_DETECT_BATCH]
+        images = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch_frames]
+        batch_results = DET.detect_faces_batch(
+            images, conf_th=0.9, scales=[face_detection_scale]
         )
-        dets.append([])
-        for bbox in bboxes:
-            dets[-1].append(
-                {
-                    "frame": fidx + start_frame,
-                    "bbox": (bbox[:-1]).tolist(),
-                    "conf": bbox[-1],
-                }
-            )  # dets has the frames info, bbox info, conf info
+        dets.extend(_build_dets(batch_results, batch_start, start_frame))
 
     savePath = os.path.join(pyworkPath, "faces.pckl")
     with open(savePath, "wb") as fil:
         pickle.dump(dets, fil)
     return dets
+
+
+_FACE_DETECT_STEP = 5  # detect every 5th 25fps frame (= 5fps); track_shot interpolates gaps
+
+
+def predict_faces_streaming(DET, video_path, fps, duration, start_seconds=0):
+    """Run face detection by streaming frames from video in batches, no JPEG I/O.
+
+    A producer thread decodes and preprocesses frames while the main thread runs
+    GPU inference, overlapping I/O with compute.
+
+    Face detection runs at _FACE_DETECT_STEP-frame intervals (5fps by default).
+    track_shot's interp1d fills bbox positions for skipped frames; num_failed_det=10
+    tolerates gaps up to 10 frames.
+    """
+    import queue
+    import threading
+
+    start_frame = int(start_seconds * fps)
+    end_frame = int((start_seconds + duration) * fps)
+    num_25fps_frames = int(duration * 25) + 1
+
+    # (fps25_idx, orig_frame_idx) pairs — only every _FACE_DETECT_STEP-th 25fps frame
+    sample_frames = []
+    for i in range(0, num_25fps_frames, _FACE_DETECT_STEP):
+        target_orig = start_frame + int(i * (fps / 25))
+        if target_orig < end_frame:
+            sample_frames.append((i, target_orig))
+
+    def _producer(cap, q):
+        batch_imgs = []
+        batch_idxs = []
+        current_orig = start_frame - 1
+        current_image = None
+        for fps25_idx, target_orig in sample_frames:
+            while current_orig < target_orig:
+                ret, frame = cap.read()
+                if not ret:
+                    if batch_imgs:
+                        q.put((batch_idxs, [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch_imgs]))
+                    cap.release()
+                    q.put(None)
+                    return
+                current_orig += 1
+                current_image = frame
+            batch_imgs.append(current_image.copy())
+            batch_idxs.append(fps25_idx)
+            if len(batch_imgs) == _FACE_DETECT_BATCH:
+                q.put((batch_idxs, [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch_imgs]))
+                batch_imgs = []
+                batch_idxs = []
+        if batch_imgs:
+            q.put((batch_idxs, [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch_imgs]))
+        cap.release()
+        q.put(None)
+
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    q = queue.Queue(maxsize=2)
+    producer = threading.Thread(target=_producer, args=(cap, q), daemon=True)
+    producer.start()
+
+    detected = {}
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        batch_idxs, images = item
+        results = DET.detect_faces_batch(images, conf_th=0.9, scales=[face_detection_scale])
+        for fps25_idx, bboxes in zip(batch_idxs, results):
+            detected[fps25_idx] = [
+                {"frame": fps25_idx, "bbox": bbox[:-1].tolist(), "conf": float(bbox[-1])}
+                for bbox in bboxes
+            ]
+
+    producer.join()
+    # Return one entry per 25fps frame; skipped frames are empty (track_shot handles gaps)
+    return [detected.get(i, []) for i in range(num_25fps_frames)]
+
+
+def crop_video_from_video(track, cropFile, video_path, fps, audio_path):
+    """Crop face track by reading needed frames sequentially from the video file."""
+    vOut = cv2.VideoWriter(
+        cropFile + "t.avi", cv2.VideoWriter_fourcc(*"XVID"), 25, (224, 224)
+    )
+    dets = {"x": [], "y": [], "s": []}
+    for det in track["bbox"]:
+        dets["s"].append(max((det[3] - det[1]), (det[2] - det[0])) / 2)
+        dets["y"].append((det[1] + det[3]) / 2)
+        dets["x"].append((det[0] + det[2]) / 2)
+    dets["s"] = signal.medfilt(dets["s"], kernel_size=13)
+    dets["x"] = signal.medfilt(dets["x"], kernel_size=13)
+    dets["y"] = signal.medfilt(dets["y"], kernel_size=13)
+
+    orig_frames = [int(f * (fps / 25)) for f in track["frame"]]
+    first_orig = orig_frames[0]
+    last_orig = orig_frames[-1]
+
+    # Map each original-fps frame number to the 25fps track indices that need it
+    orig_to_idxs = {}
+    for fidx, orig_f in enumerate(orig_frames):
+        orig_to_idxs.setdefault(orig_f, []).append(fidx)
+
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, first_orig)
+    current_orig = first_orig
+
+    while current_orig <= last_orig:
+        ret, image = cap.read()
+        if not ret:
+            break
+        if current_orig in orig_to_idxs:
+            for fidx in orig_to_idxs[current_orig]:
+                cs = crop_scale
+                bs = dets["s"][fidx]
+                bsi = int(bs * (1 + 2 * cs))
+                padded = numpy.pad(
+                    image,
+                    ((bsi, bsi), (bsi, bsi), (0, 0)),
+                    "constant",
+                    constant_values=(110, 110),
+                )
+                my = dets["y"][fidx] + bsi
+                mx = dets["x"][fidx] + bsi
+                face = padded[
+                    int(my - bs) : int(my + bs * (1 + 2 * cs)),
+                    int(mx - bs * (1 + cs)) : int(mx + bs * (1 + cs)),
+                ]
+                vOut.write(cv2.resize(face, (224, 224)))
+        current_orig += 1
+
+    cap.release()
+    vOut.release()
+
+    audioTmp = cropFile + ".wav"
+    audioStart = (track["frame"][0]) / 25
+    audioEnd = (track["frame"][-1] + 1) / 25
+    command = (
+        "ffmpeg -y -i %s -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 -threads %d -ss %.3f -to %.3f %s -loglevel panic"
+        % (audio_path, data_loader_thread, audioStart, audioEnd, audioTmp)
+    )
+    subprocess.call(command, shell=True, stdout=None)
+    _, audio = wavfile.read(audioTmp)
+    command = (
+        "ffmpeg -y -i %st.avi -i %s -threads %d -c:v copy -c:a aac %s.avi -loglevel panic"
+        % (cropFile, audioTmp, data_loader_thread, cropFile)
+    )
+    subprocess.call(command, shell=True, stdout=None)
+    os.remove(cropFile + "t.avi")
+    return {"track": track, "proc_track": dets}
+
+
+def crop_video_from_video_all_tracks(tracks, pycropPath, video_path, fps, audio_path):
+    """Crop all face tracks in a single sequential pass through the video.
+
+    Reduces video I/O from N_tracks passes down to one pass per clip.
+    """
+    if not tracks:
+        return []
+
+    proc_tracks = []
+    for track in tracks:
+        dets = {"x": [], "y": [], "s": []}
+        for det in track["bbox"]:
+            dets["s"].append(max((det[3] - det[1]), (det[2] - det[0])) / 2)
+            dets["y"].append((det[1] + det[3]) / 2)
+            dets["x"].append((det[0] + det[2]) / 2)
+        dets["s"] = signal.medfilt(dets["s"], kernel_size=13)
+        dets["x"] = signal.medfilt(dets["x"], kernel_size=13)
+        dets["y"] = signal.medfilt(dets["y"], kernel_size=13)
+        proc_tracks.append(dets)
+
+    # Build orig-fps frame → [(track_idx, fidx)] mapping
+    orig_to_entries = {}
+    for tidx, track in enumerate(tracks):
+        for fidx, frame_25fps in enumerate(track["frame"].tolist()):
+            orig_f = int(frame_25fps * (fps / 25))
+            orig_to_entries.setdefault(orig_f, []).append((tidx, fidx))
+
+    if not orig_to_entries:
+        return [{"track": t, "proc_track": p} for t, p in zip(tracks, proc_tracks)]
+
+    first_orig = min(orig_to_entries)
+    last_orig = max(orig_to_entries)
+
+    vOuts = [
+        cv2.VideoWriter(
+            os.path.join(pycropPath, "%05d" % ii) + "t.avi",
+            cv2.VideoWriter_fourcc(*"XVID"),
+            25,
+            (224, 224),
+        )
+        for ii in range(len(tracks))
+    ]
+
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, first_orig)
+    current_orig = first_orig
+    while current_orig <= last_orig:
+        ret, image = cap.read()
+        if not ret:
+            break
+        if current_orig in orig_to_entries:
+            for tidx, fidx in orig_to_entries[current_orig]:
+                dets = proc_tracks[tidx]
+                cs = crop_scale
+                bs = dets["s"][fidx]
+                bsi = int(bs * (1 + 2 * cs))
+                padded = numpy.pad(
+                    image,
+                    ((bsi, bsi), (bsi, bsi), (0, 0)),
+                    "constant",
+                    constant_values=(110, 110),
+                )
+                my = dets["y"][fidx] + bsi
+                mx = dets["x"][fidx] + bsi
+                face = padded[
+                    int(my - bs) : int(my + bs * (1 + 2 * cs)),
+                    int(mx - bs * (1 + cs)) : int(mx + bs * (1 + cs)),
+                ]
+                vOuts[tidx].write(cv2.resize(face, (224, 224)))
+        current_orig += 1
+    cap.release()
+    for vOut in vOuts:
+        vOut.release()
+
+    vid_tracks = []
+    for ii, track in enumerate(tracks):
+        cropFile = os.path.join(pycropPath, "%05d" % ii)
+        audioTmp = cropFile + ".wav"
+        audioStart = float(track["frame"][0]) / 25
+        audioEnd = float(track["frame"][-1] + 1) / 25
+        subprocess.call(
+            "ffmpeg -y -i %s -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 -threads %d -ss %.3f -to %.3f %s -loglevel panic"
+            % (audio_path, data_loader_thread, audioStart, audioEnd, audioTmp),
+            shell=True,
+        )
+        subprocess.call(
+            "ffmpeg -y -i %st.avi -i %s -threads %d -c:v copy -c:a aac %s.avi -loglevel panic"
+            % (cropFile, audioTmp, data_loader_thread, cropFile),
+            shell=True,
+        )
+        os.remove(cropFile + "t.avi")
+        vid_tracks.append({"track": track, "proc_track": proc_tracks[ii]})
+    return vid_tracks
 
 
 def bb_intersection_over_union(boxA, boxB, evalCol=False):
@@ -257,7 +502,7 @@ def crop_video(track, cropFile, start_frame=0):
     return {"track": track, "proc_track": dets}
 
 
-def crop_video_from_frames(track, cropFile, frames, start_frame=0):
+def crop_video_from_frames(track, cropFile, frames, start_frame=0, audio_path=None):
     # CPU: crop the face clips
     vOut = cv2.VideoWriter(
         cropFile + "t.avi", cv2.VideoWriter_fourcc(*"XVID"), 25, (224, 224)
@@ -320,17 +565,13 @@ def extract_MFCC(file, outPath):
 def evaluate_network(s, files):
     # GPU: active speaker detection by pretrained TalkNet
     allScores = []
-    # durationSet = {1,2,4,6} # To make the result more reliable
     durationSet = {1, 2, 4, 6}
     for file in tqdm.tqdm(files, total=len(files)):
-        fileName = os.path.splitext(file.split("/")[-1])[0]  # Load audio and video
-        # print(os.path.join(pycropPath, fileName + '.wav'))
-        _, audio = wavfile.read(os.path.join(pycropPath, fileName + ".wav"))
+        _, audio = wavfile.read(file.replace(".avi", ".wav"))
         audioFeature = python_speech_features.mfcc(
             audio, 16000, numcep=13, winlen=0.025, winstep=0.010
         )
-        # print(os.path.join(pycropPath, fileName + '.avi'))
-        video = cv2.VideoCapture(os.path.join(pycropPath, fileName + ".avi"))
+        video = cv2.VideoCapture(file)
         videoFeature = []
         while video.isOpened():
             ret, frames = video.read()
@@ -352,36 +593,52 @@ def evaluate_network(s, files):
         )
         audioFeature = audioFeature[: int(round(length * 100)), :]
         videoFeature = videoFeature[: int(round(length * 25)), :, :]
-        allScore = []  # Evaluation use TalkNet
+        allScore = []
         for duration in durationSet:
             batchSize = int(math.ceil(length / duration))
+            # Split into full-length windows and a possible shorter tail window.
+            # Full windows all have the same shape so they can be stacked into one
+            # GPU call; the tail (if any) is processed separately.
+            n_full = sum(
+                1 for i in range(batchSize)
+                if (i + 1) * duration * 100 <= audioFeature.shape[0]
+                and (i + 1) * duration * 25 <= videoFeature.shape[0]
+            )
             scores = []
-            with torch.no_grad():
-                for i in range(batchSize):
-                    inputA = (
-                        torch.FloatTensor(
-                            audioFeature[
-                                i * duration * 100 : (i + 1) * duration * 100, :
-                            ]
-                        )
-                        .unsqueeze(0)
-                        .to(s.device)
-                    )
-                    inputV = (
-                        torch.FloatTensor(
-                            videoFeature[
-                                i * duration * 25 : (i + 1) * duration * 25, :, :
-                            ]
-                        )
-                        .unsqueeze(0)
-                        .to(s.device)
-                    )
-                    embedA = s.model.forward_audio_frontend(inputA)
-                    embedV = s.model.forward_visual_frontend(inputV)
-                    embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
-                    out = s.model.forward_audio_visual_backend(embedA, embedV)
-                    score = s.lossAV.forward(out, labels=None)
-                    scores.extend(score)
+            if n_full > 0:
+                bA = torch.FloatTensor(
+                    numpy.stack([
+                        audioFeature[i * duration * 100 : (i + 1) * duration * 100, :]
+                        for i in range(n_full)
+                    ])
+                ).to(s.device)
+                bV = torch.FloatTensor(
+                    numpy.stack([
+                        videoFeature[i * duration * 25 : (i + 1) * duration * 25, :, :]
+                        for i in range(n_full)
+                    ])
+                ).to(s.device)
+                with torch.no_grad():
+                    eA = s.model.forward_audio_frontend(bA)
+                    eV = s.model.forward_visual_frontend(bV)
+                    eA, eV = s.model.forward_cross_attention(eA, eV)
+                    out = s.model.forward_audio_visual_backend(eA, eV)
+                    scores.extend(s.lossAV.forward(out, labels=None))
+            # Handle the tail window (shorter than one full duration block)
+            if n_full < batchSize:
+                i = batchSize - 1
+                inputA = torch.FloatTensor(
+                    audioFeature[i * duration * 100 :, :]
+                ).unsqueeze(0).to(s.device)
+                inputV = torch.FloatTensor(
+                    videoFeature[i * duration * 25 :, :, :]
+                ).unsqueeze(0).to(s.device)
+                with torch.no_grad():
+                    eA = s.model.forward_audio_frontend(inputA)
+                    eV = s.model.forward_visual_frontend(inputV)
+                    eA, eV = s.model.forward_cross_attention(eA, eV)
+                    out = s.model.forward_audio_visual_backend(eA, eV)
+                    scores.extend(s.lossAV.forward(out, labels=None))
             allScore.append(scores)
         allScore = numpy.round((numpy.mean(numpy.array(allScore), axis=0)), 1).astype(
             float
@@ -539,6 +796,7 @@ def main(
     return_visualization=False,
     face_boxes="",
     in_memory_threshold=0,
+    save_dir="/tmp/save",
 ):
     import subprocess
     # This preprocesstion is modified based on this [repository](https://github.com/joonson/syncnet_python).
@@ -566,19 +824,19 @@ def main(
     #     └── tracks.pckl (face tracking result)
     # ```
 
+    pyaviPath = os.path.join(save_dir, "pyavi")
+    pyframesPath = os.path.join(save_dir, "pyframes")
+    pyworkPath = os.path.join(save_dir, "pywork")
+    pycropPath = os.path.join(save_dir, "pycrop")
+    audioFilePath = os.path.join(pyaviPath, "audio.wav")
+
     # Initialization
-    if os.path.exists(save_path):
-        rmtree(save_path)
-    os.makedirs(
-        pyaviPath, exist_ok=True
-    )  # The path for the input video, input audio, output video
-    os.makedirs(pyframesPath, exist_ok=True)  # Save all the video frames
-    os.makedirs(
-        pyworkPath, exist_ok=True
-    )  # Save the results in this process by the pckl method
-    os.makedirs(
-        pycropPath, exist_ok=True
-    )  # Save the detected face clips (audio+video) in this process
+    if os.path.exists(save_dir):
+        rmtree(save_dir)
+    os.makedirs(pyaviPath, exist_ok=True)
+    os.makedirs(pyframesPath, exist_ok=True)
+    os.makedirs(pyworkPath, exist_ok=True)
+    os.makedirs(pycropPath, exist_ok=True)
 
     STORE_FRAMES_IN_MEMORY_THRESHOLD = in_memory_threshold
 
@@ -752,27 +1010,12 @@ def main(
                     ]
                 except Exception as e:
                     raise e
-    else:
-        # Temporarily commenting out the original code for extracting video frames
-        command = (
-            "ffmpeg -y -i '%s' -vf fps=25 -ss %s -t %s -threads %d -f image2 %s -loglevel panic"
-            % (
-                video_path,
-                start,
-                duration,
-                data_loader_thread,
-                os.path.join(pyframesPath, "%06d.jpg"),
-            )
-        )
-        subprocess.call(command, shell=True, stdout=None)
-        # sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the frames and save in %s \r\n" %(pyframesPath))
-
     print("Video frames extracted in %.3f seconds." % (time.time() - t))
     # Scene detection for the video frames
     print("Detecting scenes...")
     t = time.time()
     scene = scene_detect(
-        video_path, save=True, start_frame=start_frame, end_frame=int(end_seconds * fps)
+        video_path, save=False, start_frame=start_frame, end_frame=int(end_seconds * fps)
     )
     # convert scenes to 25 fps
     new_scenes = []
@@ -843,7 +1086,7 @@ def main(
         if (end_seconds - start_seconds) * fps < STORE_FRAMES_IN_MEMORY_THRESHOLD:
             faces = predict_faces_from_frames(DET, frames)
         else:
-            faces = predict_faces(DET)
+            faces = predict_faces_streaming(DET, video_path, fps, end_seconds - start_seconds, start_seconds)
 
     print("Faces detected in %.3f seconds." % (time.time() - t))
     # sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face detection and save in %s \r\n" %(pyworkPath))
@@ -868,22 +1111,17 @@ def main(
     print("Faces tracked in %.3f seconds." % (time.time() - t))
 
     print("Cropping faces...")
-    for ii, track in enumerate(allTracks):
-        if (end_seconds - start_seconds) * fps < STORE_FRAMES_IN_MEMORY_THRESHOLD:
+    t = time.time()
+    if (end_seconds - start_seconds) * fps < STORE_FRAMES_IN_MEMORY_THRESHOLD:
+        for ii, track in enumerate(allTracks):
             vidTracks.append(
                 crop_video_from_frames(
-                    track, os.path.join(pycropPath, "%05d" % ii), frames
+                    track, os.path.join(pycropPath, "%05d" % ii), frames, audio_path=audioFilePath
                 )
             )
-        else:
-            vidTracks.append(crop_video(track, os.path.join(pycropPath, "%05d" % ii)))
-    savePath = os.path.join(pyworkPath, "tracks.pckl")
-    with open(savePath, "wb") as fil:
-        pickle.dump(vidTracks, fil)
-    # sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face Crop and saved in %s tracks \r\n" %pycropPath)
+    else:
+        vidTracks = crop_video_from_video_all_tracks(allTracks, pycropPath, video_path, fps, audioFilePath)
     print("Faces cropped in %.3f seconds." % (time.time() - t))
-    fil = open(savePath, "rb")
-    vidTracks = pickle.load(fil)
 
     # Active Speaker Detection by TalkNet
     print("Detecting active speakers...")
@@ -891,17 +1129,11 @@ def main(
     files = glob.glob("%s/*.avi" % pycropPath)
     files.sort()
     scores = evaluate_network(s, files)
-    savePath = os.path.join(pyworkPath, "scores.pckl")
-    with open(savePath, "wb") as fil:
-        pickle.dump(scores, fil)
-    # sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scores extracted and saved in %s \r\n" %pyworkPath)
-
     if (end_seconds - start_seconds) * fps < STORE_FRAMES_IN_MEMORY_THRESHOLD:
         faces = [{"frame_number": i, "faces": []} for i in range(len(frames))]
     else:
-        flist = glob.glob(os.path.join(pyframesPath, "*.jpg"))
-        flist.sort()
-        faces = [{"frame_number": i, "faces": []} for i in range(len(flist))]
+        num_25fps = int((end_seconds - start_seconds) * 25) + 1
+        faces = [{"frame_number": i, "faces": []} for i in range(num_25fps)]
 
     def get_scene_by_frame_number(frame_number):
         for scene_data in new_scenes:

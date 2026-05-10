@@ -34,40 +34,46 @@ class S3FD:
         self.net.eval()
         # print('[S3FD] finished loading (%.4f sec)' % (time.time() - tstamp))
 
+    def _preprocess(self, image, scale):
+        scaled = cv2.resize(image, dsize=(0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        scaled = np.swapaxes(scaled, 1, 2)
+        scaled = np.swapaxes(scaled, 1, 0)
+        scaled = scaled[[2, 1, 0], :, :].astype("float32")
+        scaled -= img_mean
+        scaled = scaled[[2, 1, 0], :, :]
+        return scaled
+
     def detect_faces(self, image, conf_th=0.8, scales=[1]):
+        results = self.detect_faces_batch([image], conf_th=conf_th, scales=scales)
+        return results[0]
 
-        w, h = image.shape[1], image.shape[0]
+    def detect_faces_batch(self, images, conf_th=0.8, scales=[1]):
+        """Run face detection on a batch of images in a single forward pass."""
+        if not images:
+            return []
 
-        bboxes = np.empty(shape=(0, 5))
+        w, h = images[0].shape[1], images[0].shape[0]
+        results = [np.empty(shape=(0, 5)) for _ in images]
+        scale_tensor = torch.Tensor([w, h, w, h])
 
         with torch.no_grad():
             for s in scales:
-                scaled_img = cv2.resize(
-                    image, dsize=(0, 0), fx=s, fy=s, interpolation=cv2.INTER_LINEAR
-                )
+                batch = torch.stack([
+                    torch.from_numpy(self._preprocess(img, s)) for img in images
+                ]).to(self.device)
+                detections = self.net(batch).data  # [B, num_classes, num_dets, 5]
 
-                scaled_img = np.swapaxes(scaled_img, 1, 2)
-                scaled_img = np.swapaxes(scaled_img, 1, 0)
-                scaled_img = scaled_img[[2, 1, 0], :, :]
-                scaled_img = scaled_img.astype("float32")
-                scaled_img -= img_mean
-                scaled_img = scaled_img[[2, 1, 0], :, :]
-                x = torch.from_numpy(scaled_img).unsqueeze(0).to(self.device)
-                y = self.net(x)
+                for b in range(len(images)):
+                    for i in range(detections.size(1)):
+                        j = 0
+                        while detections[b, i, j, 0] > conf_th:
+                            score = detections[b, i, j, 0]
+                            pt = (detections[b, i, j, 1:] * scale_tensor).cpu().numpy()
+                            results[b] = np.vstack((results[b], (*pt, score)))
+                            j += 1
 
-                detections = y.data
-                scale = torch.Tensor([w, h, w, h])
+        for b in range(len(images)):
+            keep = nms_(results[b], 0.1)
+            results[b] = results[b][keep]
 
-                for i in range(detections.size(1)):
-                    j = 0
-                    while detections[0, i, j, 0] > conf_th:
-                        score = detections[0, i, j, 0]
-                        pt = (detections[0, i, j, 1:] * scale).cpu().numpy()
-                        bbox = (pt[0], pt[1], pt[2], pt[3], score)
-                        bboxes = np.vstack((bboxes, bbox))
-                        j += 1
-
-            keep = nms_(bboxes, 0.1)
-            bboxes = bboxes[keep]
-
-        return bboxes
+        return results
